@@ -308,7 +308,7 @@ def test_reassign_swap_two_requirements(client):
     assert resp.json() == {"reassigned": [
         {"id": 1, "from_requirement_id": "RA", "to_requirement_id": "RB"},
         {"id": 2, "from_requirement_id": "RB", "to_requirement_id": "RA"},
-    ]}
+    ], "promotions": []}
 
     recs = {r["id"]: r for r in client.get("/recognitions").json()}
     assert recs[1]["requirement_id"] == "RB"
@@ -1060,3 +1060,428 @@ def test_records_survive_restart(client, tmp_path, monkeypatch):
     with TestClient(app) as c2:
         assert len(c2.get("/recognitions").json()) == 1
         assert c2.get("/progress").json()["earned_credits"] == 4
+
+
+# ------------------------------------------------------------ 候补互认
+
+
+def waitlist_seed(client):
+    seed(
+        client,
+        courses=[
+            ("B1", 4, 90),  # 占用者
+            ("B2", 4, 85),  # 候补 1：合格
+            ("B3", 4, 55),  # 候补 2：当前成绩不达标
+            ("B4", 2, 99),  # 候补 3：学分不足
+        ],
+        requirements=[("RB1", 4)],
+        rules=[
+            ("B1", "RB1", 60),
+            ("B2", "RB1", 60),
+            ("B3", "RB1", 60),
+            ("B4", "RB1", 60),
+        ],
+    )
+
+
+def test_waitlist_register_requires_occupation_and_references(client):
+    waitlist_seed(client)
+    # 要求空缺时应直接申请，不能登记候补
+    resp = client.post("/waitlists", json={"course_id": "B2", "requirement_id": "RB1"})
+    assert resp.status_code == 409
+    assert "vacant" in resp.json()["detail"]
+
+    client.post(
+        "/recognitions", json={"items": [{"course_id": "B1", "requirement_id": "RB1"}]}
+    )
+
+    # 课程 / 要求 / 替代规则任一不存在即拒绝（聚合错误）
+    resp = client.post("/waitlists", json={"course_id": "NOPE", "requirement_id": "RB1"})
+    assert resp.status_code == 409 and "not found" in resp.json()["detail"][0]
+    resp = client.post("/waitlists", json={"course_id": "B2", "requirement_id": "NOPE"})
+    assert resp.status_code == 409 and "not found" in resp.json()["detail"][0]
+    seed(client, [("B5", 4, 90)], [("RB2", 4)], [])
+    resp = client.post("/waitlists", json={"course_id": "B5", "requirement_id": "RB1"})
+    assert resp.status_code == 409 and "no substitution rule" in resp.json()["detail"][0]
+
+    # 被互认占用的课程不能登记
+    resp = client.post("/waitlists", json={"course_id": "B1", "requirement_id": "RB1"})
+    assert resp.status_code == 409 and "already occupied" in resp.json()["detail"]
+
+    # 正常入队：当前是否合格不影响登记，返回占用者信息
+    resp = client.post("/waitlists", json={"course_id": "B2", "requirement_id": "RB1"})
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["status"] == "waiting" and body["recognition_id"] is None
+    assert body["occupied_by_recognition"] == 1
+    assert body["occupied_by_status"] == "confirmed"
+
+
+def test_waitlist_one_open_entry_per_course(client):
+    waitlist_seed(client)
+    client.post(
+        "/recognitions", json={"items": [{"course_id": "B1", "requirement_id": "RB1"}]}
+    )
+    # 另一已占用要求 RB2（由 B5 占住），B2 对其也有规则
+    seed(client, [("B5", 4, 90)], [("RB2", 4)],
+         [("B2", "RB2", 60), ("B5", "RB2", 60)])
+    client.post(
+        "/recognitions", json={"items": [{"course_id": "B5", "requirement_id": "RB2"}]}
+    )
+    # 同一课程全局只能有一条未兑现候补（即使目标是另一已占用要求）
+    assert client.post(
+        "/waitlists", json={"course_id": "B2", "requirement_id": "RB1"}
+    ).status_code == 201
+    resp = client.post("/waitlists", json={"course_id": "B2", "requirement_id": "RB2"})
+    assert resp.status_code == 409 and "open waitlist" in resp.json()["detail"]
+    # 同课同要求重复登记同样被拒
+    assert client.post(
+        "/waitlists", json={"course_id": "B2", "requirement_id": "RB1"}
+    ).status_code == 409
+
+
+def test_waitlist_does_not_occupy_or_count(client):
+    waitlist_seed(client)
+    client.post(
+        "/recognitions", json={"items": [{"course_id": "B1", "requirement_id": "RB1"}]}
+    )
+    client.post("/waitlists", json={"course_id": "B2", "requirement_id": "RB1"})
+
+    # 候补不计入进度，要求仍由互认 1 占用
+    req = [r for r in client.get("/progress").json()["requirements"]
+           if r["requirement_id"] == "RB1"][0]
+    assert req["status"] == "confirmed" and req["recognition_id"] == 1
+    assert req["earned_credits"] == 4
+
+    # 候补不占用课程：B2 仍可被对其开放规则的空缺要求直接认下
+    seed(client, [], [("RB2", 4)], [("B2", "RB2", 60)])
+    resp = client.post(
+        "/recognitions", json={"items": [{"course_id": "B2", "requirement_id": "RB2"}]}
+    )
+    assert resp.status_code == 201
+    # 此后该课程已占用，不能再登记新候补
+    assert client.post(
+        "/waitlists", json={"course_id": "B2", "requirement_id": "RB1"}
+    ).status_code == 409
+
+
+def test_waitlist_query_order_and_filters(client):
+    waitlist_seed(client)
+    client.post(
+        "/recognitions", json={"items": [{"course_id": "B1", "requirement_id": "RB1"}]}
+    )
+    ids = []
+    for cid in ("B2", "B3", "B4"):
+        ids.append(
+            client.post(
+                "/waitlists", json={"course_id": cid, "requirement_id": "RB1"}
+            ).json()["id"]
+        )
+    # 按要求查询 -> 登记顺序即接替顺序
+    rows = client.get("/waitlists", params={"requirement_id": "RB1"}).json()
+    assert [w["id"] for w in rows] == ids
+    assert all(w["status"] == "waiting" for w in rows)
+    assert len(client.get("/waitlists", params={"status": "waiting"}).json()) == 3
+    assert client.get("/waitlists", params={"requirement_id": "NOPE"}).json() == []
+
+
+def test_revoke_promotes_first_qualified_and_skips_rest(client):
+    waitlist_seed(client)
+    client.post(
+        "/recognitions", json={"items": [{"course_id": "B1", "requirement_id": "RB1"}]}
+    )
+    w2 = client.post(
+        "/waitlists", json={"course_id": "B2", "requirement_id": "RB1"}
+    ).json()["id"]
+    w3 = client.post(
+        "/waitlists", json={"course_id": "B3", "requirement_id": "RB1"}
+    ).json()["id"]
+    w4 = client.post(
+        "/waitlists", json={"course_id": "B4", "requirement_id": "RB1"}
+    ).json()["id"]
+
+    # 撤销占用：B2 合格且排最前 -> 接替为已认；B3/B4 保留候补
+    resp = client.delete("/recognitions/1")
+    assert resp.status_code == 200
+    promotion = resp.json()["promotion"]
+    assert promotion == {
+        "requirement_id": "RB1",
+        "waitlist_id": w2,
+        "recognition_id": 2,
+        "course_id": "B2",
+    }
+
+    recs = {r["id"]: r for r in client.get("/recognitions").json()}
+    assert recs[2]["course_id"] == "B2" and recs[2]["requirement_id"] == "RB1"
+    assert recs[2]["status"] == "confirmed"
+    req = [r for r in client.get("/progress").json()["requirements"]
+           if r["requirement_id"] == "RB1"][0]
+    assert req["recognition_id"] == 2 and req["earned_credits"] == 4
+
+    rows = {w["id"]: w for w in client.get(
+        "/waitlists", params={"requirement_id": "RB1"}).json()}
+    assert rows[w2]["status"] == "fulfilled" and rows[w2]["recognition_id"] == 2
+    assert rows[w2]["fulfilled_at"]
+    assert all(rows[i]["status"] == "waiting" for i in (w3, w4))
+
+
+def test_promotion_skips_no_longer_free_course(client):
+    waitlist_seed(client)
+    client.post(
+        "/recognitions", json={"items": [{"course_id": "B1", "requirement_id": "RB1"}]}
+    )
+    w2 = client.post(
+        "/waitlists", json={"course_id": "B2", "requirement_id": "RB1"}
+    ).json()["id"]
+    w3 = client.post(
+        "/waitlists", json={"course_id": "B3", "requirement_id": "RB1"}
+    ).json()["id"]
+
+    # B2 在等待期间被另一空缺要求认下（候补不占用课程，允许）
+    seed(client, [], [("RB2", 4)], [("B2", "RB2", 60)])
+    client.post(
+        "/recognitions", json={"items": [{"course_id": "B2", "requirement_id": "RB2"}]}
+    )
+    # 让 B3 当前合格
+    client.put("/courses/B3", json={"score": 88})
+
+    resp = client.delete("/recognitions/1")
+    # B2 已不空闲 -> 跳过；B3 合格 -> 接替
+    assert resp.json()["promotion"]["waitlist_id"] == w3
+    assert resp.json()["promotion"]["course_id"] == "B3"
+    rows = {w["id"]: w for w in client.get(
+        "/waitlists", params={"requirement_id": "RB1"}).json()}
+    assert rows[w2]["status"] == "waiting"  # 没选上，继续候补
+    assert rows[w3]["status"] == "fulfilled"
+
+
+def test_no_qualified_candidate_leaves_vacant(client):
+    waitlist_seed(client)
+    client.post(
+        "/recognitions", json={"items": [{"course_id": "B1", "requirement_id": "RB1"}]}
+    )
+    w3 = client.post(
+        "/waitlists", json={"course_id": "B3", "requirement_id": "RB1"}
+    ).json()["id"]
+    w4 = client.post(
+        "/waitlists", json={"course_id": "B4", "requirement_id": "RB1"}
+    ).json()["id"]
+
+    # 全员当前不合格（B3 成绩 55、B4 学分 2）-> 无人接替，要求空缺，候补保留
+    resp = client.delete("/recognitions/1")
+    assert resp.json()["promotion"] is None
+    req = [r for r in client.get("/progress").json()["requirements"]
+           if r["requirement_id"] == "RB1"][0]
+    assert req["status"] == "vacant" and req["earned_credits"] == 0
+    rows = client.get(
+        "/waitlists", params={"requirement_id": "RB1", "status": "waiting"}).json()
+    assert {w["id"] for w in rows} == {w3, w4}
+
+    # 成绩恢复不自动兑现：没有新的名额释放事件
+    client.put("/courses/B3", json={"score": 90})
+    assert client.get("/progress").json()["requirements"][0]["status"] == "vacant"
+    rows = client.get("/waitlists", params={"requirement_id": "RB1"}).json()
+    assert all(w["status"] == "waiting" for w in rows)
+
+    # 下一次释放（再认一条再撤销）才按顺序兑现 B3
+    client.post(
+        "/recognitions", json={"items": [{"course_id": "B1", "requirement_id": "RB1"}]}
+    )
+    resp = client.delete("/recognitions/2")
+    assert resp.json()["promotion"]["waitlist_id"] == w3
+    assert resp.json()["promotion"]["course_id"] == "B3"
+
+
+def test_pending_occupant_supports_waitlist_and_revoke_promotes(client):
+    waitlist_seed(client)
+    client.post(
+        "/recognitions", json={"items": [{"course_id": "B1", "requirement_id": "RB1"}]}
+    )
+    client.put("/courses/B1", json={"score": 30})  # 互认 1 转待复核但仍占用
+    resp = client.post("/waitlists", json={"course_id": "B2", "requirement_id": "RB1"})
+    assert resp.status_code == 201
+    assert resp.json()["occupied_by_status"] == "pending"
+    w2 = resp.json()["id"]
+
+    # 更正不触发接替（即便 B1 成绩恢复）
+    client.put("/courses/B1", json={"score": 90})
+    assert client.get("/progress").json()["requirements"][0]["status"] == "pending"
+
+    # 撤销待复核记录 -> B2 接替
+    resp = client.delete("/recognitions/1")
+    assert resp.json()["promotion"] == {
+        "requirement_id": "RB1",
+        "waitlist_id": w2,
+        "recognition_id": 2,
+        "course_id": "B2",
+    }
+
+
+def test_reassign_freed_requirement_promotes_waitlist(client):
+    reassign_seed(client)  # A1/A2 各 4 学分；RA/RB/RC；A1 对 RA/RB 有规则
+    seed(client, [], [], [("A1", "RC", 60)])
+    # 候补者 N1 对 RA 有规则（空闲、合格）
+    seed(client, [("N1", 4, 80)], [], [("N1", "RA", 60)])
+    client.post(
+        "/recognitions", json={"items": [{"course_id": "A1", "requirement_id": "RA"}]}
+    )  # 互认 1
+    wl = client.post(
+        "/waitlists", json={"course_id": "N1", "requirement_id": "RA"}
+    ).json()["id"]
+
+    # A1 改派 RA -> RC：RA 净释放，同事务内 N1 接替
+    resp = client.post(
+        "/recognitions/reassign",
+        json={"items": [{"recognition_id": 1, "target_requirement_id": "RC"}]},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["promotions"] == [
+        {"requirement_id": "RA", "waitlist_id": wl, "recognition_id": 2, "course_id": "N1"}
+    ]
+    by_req = {r["requirement_id"]: r
+              for r in client.get("/progress").json()["requirements"]}
+    assert by_req["RA"]["course_id"] == "N1" and by_req["RA"]["status"] == "confirmed"
+    assert by_req["RC"]["course_id"] == "A1"
+
+
+def test_reassign_swap_and_reoccupied_requirement_no_promotion(client):
+    reassign_seed(client)
+    seed(client, [("N1", 4, 80), ("N2", 4, 80)], [],
+         [("N1", "RA", 60), ("N2", "RB", 60)])
+    client.post(
+        "/recognitions",
+        json={"items": [
+            {"course_id": "A1", "requirement_id": "RA"},
+            {"course_id": "A2", "requirement_id": "RB"},
+        ]},
+    )  # 1, 2
+    client.post("/waitlists", json={"course_id": "N1", "requirement_id": "RA"})
+    client.post("/waitlists", json={"course_id": "N2", "requirement_id": "RB"})
+
+    # 互换：RA/RB 都在本批目标中 -> 不触发任何接替
+    resp = client.post(
+        "/recognitions/reassign",
+        json={"items": [
+            {"recognition_id": 1, "target_requirement_id": "RB"},
+            {"recognition_id": 2, "target_requirement_id": "RA"},
+        ]},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["promotions"] == []
+    waiting = client.get("/waitlists", params={"status": "waiting"}).json()
+    assert len(waiting) == 2
+
+    # 本批重新占用：A1 从 RA 移到 RC、A2 从 RB 移到 RA（RA 被本批重新占用），
+    # 只有 RB 净释放 -> 仅 N2 接替，N1 继续等
+    seed(client, [], [], [("A1", "RC", 60)])
+    resp = client.post(
+        "/recognitions/reassign",
+        json={"items": [
+            {"recognition_id": 1, "target_requirement_id": "RC"},
+            {"recognition_id": 2, "target_requirement_id": "RA"},
+        ]},
+    )
+    assert resp.status_code == 200
+    assert [p["course_id"] for p in resp.json()["promotions"]] == ["N2"]
+    waiting = client.get("/waitlists", params={"status": "waiting"}).json()
+    assert [w["course_id"] for w in waiting] == ["N1"]
+
+
+def test_failed_reassign_does_not_touch_waitlists_or_progress(client):
+    reassign_seed(client)
+    seed(client, [], [], [("A1", "RC", 60)])
+    seed(client, [("N1", 4, 80)], [], [("N1", "RA", 60)])
+    client.post(
+        "/recognitions",
+        json={"items": [
+            {"course_id": "A1", "requirement_id": "RA"},
+            {"course_id": "A2", "requirement_id": "RB"},
+        ]},
+    )
+    client.post("/waitlists", json={"course_id": "N1", "requirement_id": "RA"})
+
+    # 第二条合格（RA 净释放本应触发 N1），但第一条目标 RC 没有规则 -> 整批不变
+    # （A1 对 RC 有规则，这里用不存在的要求触发整批失败）
+    resp = client.post(
+        "/recognitions/reassign",
+        json={"items": [
+            {"recognition_id": 1, "target_requirement_id": "NOPE"},
+            {"recognition_id": 2, "target_requirement_id": "RA"},
+        ]},
+    )
+    assert resp.status_code == 409
+    # 无新互认、无候补兑现、进度不变
+    recs = client.get("/recognitions").json()
+    assert {r["id"]: r["requirement_id"] for r in recs} == {1: "RA", 2: "RB"}
+    assert client.get("/progress").json()["earned_credits"] == 8
+    rows = client.get("/waitlists").json()
+    assert len(rows) == 1 and rows[0]["status"] == "waiting"
+
+
+def test_revoke_promoted_recognition_keeps_history_and_can_promote_again(client):
+    waitlist_seed(client)
+    client.post(
+        "/recognitions", json={"items": [{"course_id": "B1", "requirement_id": "RB1"}]}
+    )
+    w2 = client.post(
+        "/waitlists", json={"course_id": "B2", "requirement_id": "RB1"}
+    ).json()["id"]
+    w3 = client.post(
+        "/waitlists", json={"course_id": "B3", "requirement_id": "RB1"}
+    ).json()["id"]
+    # 第一次释放：B2 接替成互认 2（B3 当时不达标）
+    assert client.delete("/recognitions/1").json()["promotion"]["waitlist_id"] == w2
+    # 让 B3 合格后撤销已兑现的互认 2：来源候补历史保留（recognition_id 置空），
+    # 同事务内 B3 再次接替
+    client.put("/courses/B3", json={"score": 70})
+    resp = client.delete("/recognitions/2")
+    assert resp.json()["promotion"]["waitlist_id"] == w3
+    rows = {w["id"]: w for w in client.get("/waitlists").json()}
+    assert rows[w2]["status"] == "fulfilled" and rows[w2]["recognition_id"] is None
+    assert rows[w3]["status"] == "fulfilled"
+    req = [r for r in client.get("/progress").json()["requirements"]
+           if r["requirement_id"] == "RB1"][0]
+    assert req["status"] == "confirmed" and req["course_id"] == "B3"
+
+
+def test_concurrent_revoke_and_correction_serialized_promotion(client):
+    waitlist_seed(client)
+    client.post(
+        "/recognitions", json={"items": [{"course_id": "B1", "requirement_id": "RB1"}]}
+    )
+    client.post("/waitlists", json={"course_id": "B2", "requirement_id": "RB1"})
+    client.post("/waitlists", json={"course_id": "B3", "requirement_id": "RB1"})
+
+    def op(i):
+        with TestClient(app) as c:
+            if i % 3 == 0:
+                return c.delete("/recognitions/1").status_code
+            if i % 3 == 1:
+                return c.put("/courses/B2", json={"score": 50 + (i % 45)}).status_code
+            return c.put("/courses/B3", json={"score": 90}).status_code
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        codes = list(ex.map(op, range(24)))
+    assert all(code in (200, 404) for code in codes)
+
+    # 串行化不变量：RB1 至多一条占用记录；至多一条候补被兑现；
+    # 若已兑现，接替互认的课程与其来源候补一致（之后可能被并发更正
+    # 转待复核，状态可能是 confirmed/pending，但占用始终唯一）。
+    active = [r for r in client.get("/recognitions").json()
+              if r["requirement_id"] == "RB1" and r["status"] in ("confirmed", "pending")]
+    assert len(active) <= 1
+    fulfilled = client.get(
+        "/waitlists", params={"requirement_id": "RB1", "status": "fulfilled"}).json()
+    assert len(fulfilled) <= 1
+    if fulfilled:
+        entry = fulfilled[0]
+        # 已接替互认可能随后被撤销（来源候补 recognition_id 置空）；
+        # 仍在时课程与来源候补必须一致
+        if entry["recognition_id"] is not None:
+            rec = next(r for r in client.get("/recognitions").json()
+                       if r["id"] == entry["recognition_id"])
+            assert rec["course_id"] == entry["course_id"]
+            assert rec["status"] in ("confirmed", "pending")
+        if active:
+            assert active[0]["course_id"] in ("B2", "B3")
+

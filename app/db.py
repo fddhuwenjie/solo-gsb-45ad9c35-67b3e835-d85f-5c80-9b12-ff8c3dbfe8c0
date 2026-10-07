@@ -3,8 +3,8 @@
 并发模型：
 - 所有写操作通过 ``write_tx`` 进入，先取进程级可重入锁，再以
   ``BEGIN IMMEDIATE`` 开启事务（立即持有 SQLite 写锁），因此
-  "检查冲突 -> 写入" 是原子的，并发申请/更正/复核/改派不会交错，
-  不会出现重复使用或中间态。
+  "检查冲突 -> 写入" 是原子的，并发申请/更正/复核/改派/撤销/修订与
+  候补接替不会交错，不会出现重复使用或中间态。
 - 读操作使用独立连接，WAL 模式下读写互不阻塞；涉及多张表的一致性
   查询（如进度）走 ``read_tx``，多条 SELECT 取同一快照。
 """
@@ -49,6 +49,25 @@ CREATE TABLE IF NOT EXISTS recognitions (
 
 CREATE INDEX IF NOT EXISTS idx_recognitions_course ON recognitions (course_id);
 CREATE INDEX IF NOT EXISTS idx_recognitions_requirement ON recognitions (requirement_id);
+
+-- 候补互认：候补不占用课程或要求，也不计入进度。
+-- 一门课程至多存在一条未兑现（waiting）候补；兑现后记录保留为 fulfilled
+-- 并指向接替产生的互认，撤销该互认不清除来源候补（外键置空）。
+CREATE TABLE IF NOT EXISTS waitlists (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    course_id      TEXT NOT NULL REFERENCES external_courses (id),
+    requirement_id TEXT NOT NULL REFERENCES requirements (id),
+    status         TEXT NOT NULL CHECK (status IN ('waiting', 'fulfilled')),
+    recognition_id INTEGER REFERENCES recognitions (id) ON DELETE SET NULL,
+    created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+    fulfilled_at   TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_waitlists_requirement ON waitlists (requirement_id);
+CREATE INDEX IF NOT EXISTS idx_waitlists_course ON waitlists (course_id);
+-- 课程级约束：同一课程同时只能有一条未兑现候补（"且没有其他未兑现候补"）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_waitlists_one_open_per_course
+    ON waitlists (course_id) WHERE status = 'waiting';
 """
 
 
