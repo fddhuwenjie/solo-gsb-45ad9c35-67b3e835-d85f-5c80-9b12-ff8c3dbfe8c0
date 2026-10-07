@@ -49,6 +49,27 @@ CREATE TABLE IF NOT EXISTS recognitions (
 
 CREATE INDEX IF NOT EXISTS idx_recognitions_course ON recognitions (course_id);
 CREATE INDEX IF NOT EXISTS idx_recognitions_requirement ON recognitions (requirement_id);
+
+CREATE TABLE IF NOT EXISTS waitlists (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    course_id      TEXT NOT NULL REFERENCES external_courses (id),
+    requirement_id TEXT NOT NULL REFERENCES requirements (id),
+    -- waiting=候补中（不占用课程/要求、不计进度）；fulfilled=已兑现
+    status         TEXT NOT NULL CHECK (status IN ('waiting', 'fulfilled')),
+    -- 兑现来源互认编号；互认可被撤销，因此不加 REFERENCES 外键约束，
+    -- 仅作编号留存（撤销已兑现互认不影响候补历史）。
+    recognition_id INTEGER,
+    created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+    fulfilled_at   TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_waitlists_requirement
+    ON waitlists (requirement_id, id);
+CREATE INDEX IF NOT EXISTS idx_waitlists_course ON waitlists (course_id);
+-- 一门课程至多保留一条未兑现候补（兑现后释放该名额），与应用层检查互为兜底，
+-- 即便绕过进程锁（多进程）也由 SQLite 写锁 + 唯一索引保证。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_waitlists_one_open_per_course
+    ON waitlists (course_id) WHERE status = 'waiting';
 """
 
 

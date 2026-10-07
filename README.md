@@ -12,7 +12,8 @@
 - **整批改派**：一次把多条**已认**互认改派到各自的目标要求（`POST /recognitions/reassign`）。按本批原占用**同时释放后**的状态核对：互认编号与目标要求在批内均不得重复、来源须是现存已认记录（待复核不可改派）、课程对目标要求的替代规则/当前成绩/当前学分均合格、目标要求未被批外的已认或待复核记录占用（两条记录互换要求不会相互冲突）。任一项不合格则**原互认与进度整批不变**；成功则保留原互认编号、更新要求与进度。
 - **培养方案修订**：`POST /program/revisions` 一次提交多项**要求所需学分**与**替代规则最低成绩**改动（两类各为可选数组，至少提交一项）。同一要求/同一替代规则不得在本批重复，引用不存在或数值无效则**整次不生效**（409/422，事务回滚）；所有改动在一个事务内**共同生效**，随后按新标准复查现存互认：失去资格的**已认**转待复核、停止计分但继续占用两端，原本**待复核**的记录即使按新标准重新达标也须显式复核。成功返回已修改项目与转待复核的互认编号；已认进度按新学分计算，之后的申请、改派与复核均按新标准判断。
 - **查询**：`/progress` 区分已认（计分）、待复核（不计分但占用）、空缺；一次查询取同一提交快照，不会混出改派/修订前后的结果。
-- **并发**：所有写操作（申请、成绩更正、复核、撤销、改派、培养方案修订）在进程锁 + `BEGIN IMMEDIATE` 事务内串行执行，检查与写入原子完成，并发操作不会重复使用或暴露中间态；改派/修订之后的操作一律按新标准判断。
+- **候补互认**：要求已被占用时可登记候补（`POST /waitlists`，提交外校课程与要求编号）。仅当课程、要求、替代规则都存在，要求正由一条"已认/待复核"互认占用，课程未被互认占用且没有其它未兑现候补时才入队；候补不占用课程或要求，也不计入进度。撤销互认或整批改派释放名额后，在**同一事务内**按候补登记顺序依次核对：要求仍空缺、课程仍空闲、没有其它未兑现候补、且按**当时**的学分/成绩/替代规则合格——跳过不合格者，由首个合格者接替为已认并计分，其余保留候补；无人合格则保持空缺。改派互换或本批重新占用的要求不触发接替。撤销/改派响应返回接替出来的互认编号与来源候补编号；操作失败（如改派整批拒绝）时原候补、互认与进度都不变。`GET /waitlists` 可按要求（看候补顺序）、课程、状态查询候补与兑现结果。
+- **并发**：所有写操作（申请、成绩更正、复核、撤销、改派、培养方案修订、候补登记）在进程锁 + `BEGIN IMMEDIATE` 事务内串行执行，检查与写入原子完成，并发操作不会重复使用或暴露中间态；接替与释放名额在同一事务内完成，并发申请、更正和方案修订不能越过接替过程；改派/修订之后的操作一律按新标准判断。
 
 ## 启动
 
@@ -140,6 +141,73 @@ curl -s -X POST localhost:8000/program/revisions -H 'Content-Type: application/j
 curl -s -X POST localhost:8000/recognitions/1/review   # -> status: confirmed
 ```
 
+### 候补互认示例
+
+```bash
+# 14. 候补登记与接替：要求 RW 被占用时，其它课程排队，撤销后按登记顺序兑现
+#     下列编号独立，可在全新数据库上直接执行
+curl -s -X POST localhost:8000/courses -H 'Content-Type: application/json' \
+  -d '{"id": "W1", "credits": 4, "score": 90}'
+curl -s -X POST localhost:8000/courses -H 'Content-Type: application/json' \
+  -d '{"id": "W2", "credits": 4, "score": 85}'
+curl -s -X POST localhost:8000/courses -H 'Content-Type: application/json' \
+  -d '{"id": "W3", "credits": 4, "score": 70}'
+curl -s -X POST localhost:8000/requirements -H 'Content-Type: application/json' \
+  -d '{"id": "RW", "required_credits": 4}'
+curl -s -X POST localhost:8000/substitutions -H 'Content-Type: application/json' \
+  -d '{"course_id": "W1", "requirement_id": "RW", "min_score": 60}'
+curl -s -X POST localhost:8000/substitutions -H 'Content-Type: application/json' \
+  -d '{"course_id": "W2", "requirement_id": "RW", "min_score": 60}'
+curl -s -X POST localhost:8000/substitutions -H 'Content-Type: application/json' \
+  -d '{"course_id": "W3", "requirement_id": "RW", "min_score": 80}'
+# W1 先占用 RW
+curl -s -X POST localhost:8000/recognitions -H 'Content-Type: application/json' \
+  -d '{"items": [{"course_id": "W1", "requirement_id": "RW"}]}'
+# W2、W3 登记候补（候补不占用、不计进度）；登记顺序即兑现顺序
+curl -s -X POST localhost:8000/waitlists -H 'Content-Type: application/json' \
+  -d '{"course_id": "W2", "requirement_id": "RW"}'
+# -> {"id":1,...,"status":"waiting","recognition_id":null,...}
+curl -s -X POST localhost:8000/waitlists -H 'Content-Type: application/json' \
+  -d '{"course_id": "W3", "requirement_id": "RW"}'
+# 按要求查询候补顺序
+curl -s 'localhost:8000/waitlists?requirement_id=RW'
+# -> W2(id=1) 在前、W3(id=2) 在后，均为 waiting
+
+# 撤销 W1 的互认：同事务内按顺序核对，W2 合格 -> 接替为已认并计分
+curl -s -X DELETE localhost:8000/recognitions/1
+# -> {"revoked":1,
+#     "released":{"course_id":"W1","requirement_id":"RW"},
+#     "promoted":[{"recognition_id":2,"waitlist_id":1,
+#                  "course_id":"W2","requirement_id":"RW"}]}
+curl -s localhost:8000/progress   # RW 由互认 2（W2）占用，earned_credits=4
+curl -s 'localhost:8000/waitlists?requirement_id=RW'
+# -> 候补 1 status=fulfilled、recognition_id=2；候补 2（W3）仍 waiting
+
+# 15. 不合格者被跳过、改派释放也触发兑现；改派互换不触发
+#     现在 RW 由 W2（互认 2）占用，W3 仍在候补，且成绩 70 < 规则 80
+curl -s -X DELETE localhost:8000/recognitions/2
+# -> promoted 为 []：W3 当前不合格，无人接替，RW 保持空缺、W3 仍在候补
+curl -s localhost:8000/progress   # RW status=vacant，earned_credits=0
+
+# 整批改派释放名额同样触发：W1 占用 RW 后改派到另一要求，W3 按"当时"标准核对
+curl -s -X POST localhost:8000/requirements -H 'Content-Type: application/json' \
+  -d '{"id": "RO", "required_credits": 4}'
+curl -s -X POST localhost:8000/substitutions -H 'Content-Type: application/json' \
+  -d '{"course_id": "W1", "requirement_id": "RO", "min_score": 60}'
+curl -s -X POST localhost:8000/recognitions -H 'Content-Type: application/json' \
+  -d '{"items": [{"course_id": "W1", "requirement_id": "RW"}]}'   # 新互认 id=3
+# 先放宽 W3->RW 的最低成绩（方案修订不会自动兑现候补）
+curl -s -X POST localhost:8000/program/revisions -H 'Content-Type: application/json' \
+  -d '{"substitution_changes":[{"course_id":"W3","requirement_id":"RW","min_score":60}]}'
+# 把 W1 从 RW 改派到 RO -> RW 释放，W3 在同事务内接替
+curl -s -X POST localhost:8000/recognitions/reassign -H 'Content-Type: application/json' \
+  -d '{"items":[{"recognition_id":3,"target_requirement_id":"RO"}]}'
+# -> {"reassigned":[{"id":3,"from_requirement_id":"RW","to_requirement_id":"RO"}],
+#     "promoted":[{"recognition_id":4,"waitlist_id":2,
+#                  "course_id":"W3","requirement_id":"RW"}]}
+# 若两条互认互换要求，两个要求都在本批内重新占用，则 promoted 为 []。
+```
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -156,5 +224,7 @@ curl -s -X POST localhost:8000/recognitions/1/review   # -> status: confirmed
 | POST | `/recognitions/reassign` | 整批改派已认互认到新要求（整批成功或整批不变） |
 | POST | `/program/revisions` | 培养方案修订：批量改要求学分/规则最低成绩，按新标准复查已认互认 |
 | POST | `/recognitions/{id}/review` | 复核待复核记录 |
-| DELETE | `/recognitions/{id}` | 撤销并释放占用 |
-| GET | `/progress` | 进度：已认/待复核/空缺与学分统计 |
+| DELETE | `/recognitions/{id}` | 撤销并释放占用（同事务按顺序兑现候补） |
+| POST | `/waitlists` | 登记候补互认（要求被占用、课程空闲且无其它未兑现候补） |
+| GET | `/waitlists?requirement_id=&course_id=&status=waiting\|fulfilled` | 按要求查候补顺序与兑现结果 |
+| GET | `/progress` | 进度：已认/待复核/空缺与学分统计（候补不计入） |

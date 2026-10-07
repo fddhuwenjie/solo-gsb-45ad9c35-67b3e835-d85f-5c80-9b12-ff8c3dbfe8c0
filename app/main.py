@@ -13,6 +13,10 @@
 - 培养方案修订：一次修改多项要求所需学分与替代规则最低成绩，全部
   改动共同生效；随后按新标准复查现存已认互认，失去资格的转待复核
   （停止计分但保留两端占用），原待复核记录即使重新达标也须显式复核。
+- 候补互认：要求被占用时可登记候补（课程不占用两端、不计进度）。
+  撤销互认或整批改派释放名额后，在同一事务内按登记顺序依次核对
+  候补课程是否仍空闲且按当时标准合格，首个合格者接替为已认并计分，
+  其余保留候补；改派互换或本批重新占用的要求不触发接替。
 """
 
 from __future__ import annotations
@@ -96,6 +100,11 @@ class ProgramRevisionIn(BaseModel):
     substitution_changes: List[SubstitutionChange] = Field(default_factory=list)
 
 
+class WaitlistIn(BaseModel):
+    course_id: str = Field(min_length=1, max_length=64)
+    requirement_id: str = Field(min_length=1, max_length=64)
+
+
 # ---------------------------------------------------------------- helpers
 
 
@@ -125,6 +134,86 @@ def _qualifies(conn, course_id: str, requirement_id: str) -> bool:
     if row is None:
         return False
     return row["credits"] >= row["required_credits"] and row["score"] >= row["min_score"]
+
+
+def _row_to_waitlist(row) -> dict:
+    return {
+        "id": row["id"],
+        "course_id": row["course_id"],
+        "requirement_id": row["requirement_id"],
+        "status": row["status"],
+        "recognition_id": row["recognition_id"],
+        "created_at": row["created_at"],
+        "fulfilled_at": row["fulfilled_at"],
+    }
+
+
+def _fill_waitlists(conn, requirement_ids) -> List[dict]:
+    """名额释放后的候补接替（必须在写事务内、主操作完成后调用）。
+
+    对每个要求按候补登记顺序（id 升序）检查：要求仍空缺、课程未被任何
+    已认/待复核互认占用、课程没有其它未兑现候补、课程按"当时"的学分/
+    成绩/替代规则仍合格——首个合格者接替为已认并计分，其余候补保留；
+    不合格（含课程已被占用、已另有候补）者跳过，可在下次释放时再核对。
+    没有任何合格者则要求保持空缺。
+    """
+    promoted: List[dict] = []
+    for requirement_id in sorted(set(requirement_ids)):
+        # 本批重新占用（或互换后仍被占用）的要求不触发接替
+        occupied = conn.execute(
+            "SELECT 1 FROM recognitions WHERE requirement_id = ? "
+            "AND status IN ('confirmed', 'pending')",
+            (requirement_id,),
+        ).fetchone()
+        if occupied is not None:
+            continue
+        entries = conn.execute(
+            "SELECT id, course_id FROM waitlists "
+            "WHERE requirement_id = ? AND status = 'waiting' ORDER BY id",
+            (requirement_id,),
+        ).fetchall()
+        for entry in entries:
+            course_id = entry["course_id"]
+            # 课程仍须空闲：未被任何互认占用
+            if conn.execute(
+                "SELECT 1 FROM recognitions WHERE course_id = ? "
+                "AND status IN ('confirmed', 'pending')",
+                (course_id,),
+            ).fetchone():
+                continue
+            # 且没有其它未兑现候补（该课程可能对别的要求也排了队；
+            # 正常情况下登记时已挡住，这里防御性再查一次）
+            if conn.execute(
+                "SELECT 1 FROM waitlists WHERE course_id = ? "
+                "AND status = 'waiting' AND id <> ?",
+                (course_id, entry["id"]),
+            ).fetchone():
+                continue
+            # 按当时的学分、成绩及替代规则重新核对
+            if not _qualifies(conn, course_id, requirement_id):
+                continue
+            cur = conn.execute(
+                "INSERT INTO recognitions (course_id, requirement_id, status) "
+                "VALUES (?, ?, 'confirmed')",
+                (course_id, requirement_id),
+            )
+            recognition_id = cur.lastrowid
+            conn.execute(
+                "UPDATE waitlists SET status = 'fulfilled', recognition_id = ?, "
+                "fulfilled_at = datetime('now') WHERE id = ?",
+                (recognition_id, entry["id"]),
+            )
+            promoted.append(
+                {
+                    "recognition_id": recognition_id,
+                    "waitlist_id": entry["id"],
+                    "course_id": course_id,
+                    "requirement_id": requirement_id,
+                }
+            )
+            # 该要求名额已由首个合格者接替，其余候补保留
+            break
+    return promoted
 
 
 # ---------------------------------------------------------------- 基础登记
@@ -624,7 +713,13 @@ def reassign_recognitions(batch: ReassignBatchIn):
                 (target["to_requirement_id"], target["id"]),
             )
             reassigned.append(target)
-    return {"reassigned": reassigned}
+
+        # 仅处理"真正让出"的要求：本批释放后又被本批重新占用（含互换）
+        # 的要求不得触发接替；其余释放的要求在同一事务内按登记顺序兑现候补
+        from_reqs = {t["from_requirement_id"] for t in originals}
+        to_reqs = {t["to_requirement_id"] for t in originals}
+        promoted = _fill_waitlists(conn, from_reqs - to_reqs)
+    return {"reassigned": reassigned, "promoted": promoted}
 
 
 @app.post("/recognitions/{recognition_id}/review")
@@ -669,11 +764,129 @@ def revoke_recognition(recognition_id: int):
         ).fetchone()
         if rec is None:
             raise HTTPException(404, f"recognition {recognition_id} not found")
+        released_course, released_requirement = rec["course_id"], rec["requirement_id"]
         conn.execute("DELETE FROM recognitions WHERE id = ?", (recognition_id,))
+        # 同一事务内按登记顺序处理该要求的候补：首个仍合格者接替为已认
+        promoted = _fill_waitlists(conn, [released_requirement])
     return {
         "revoked": recognition_id,
-        "released": {"course_id": rec["course_id"], "requirement_id": rec["requirement_id"]},
+        "released": {
+            "course_id": released_course,
+            "requirement_id": released_requirement,
+        },
+        "promoted": promoted,
     }
+
+
+# ---------------------------------------------------------------- 候补互认
+
+
+@app.post("/waitlists", status_code=201)
+def create_waitlist(body: WaitlistIn):
+    """登记候补互认。
+
+    仅当课程、要求、替代规则都存在；要求正由一条"已认/待复核"互认
+    占用；课程未被互认占用且没有其它未兑现候补时才入队。候补不占用
+    课程或要求，也不计入进度。
+    """
+    errors: List[str] = []
+    with db.write_tx() as conn:
+        if conn.execute(
+            "SELECT 1 FROM external_courses WHERE id = ?", (body.course_id,)
+        ).fetchone() is None:
+            errors.append(f"course {body.course_id!r} not found")
+        if conn.execute(
+            "SELECT 1 FROM requirements WHERE id = ?", (body.requirement_id,)
+        ).fetchone() is None:
+            errors.append(f"requirement {body.requirement_id!r} not found")
+        if conn.execute(
+            "SELECT 1 FROM substitutions WHERE course_id = ? AND requirement_id = ?",
+            (body.course_id, body.requirement_id),
+        ).fetchone() is None:
+            errors.append(
+                f"no substitution rule for "
+                f"({body.course_id!r}, {body.requirement_id!r})"
+            )
+        if errors:
+            # 引用不存在 -> 整次不写入
+            raise HTTPException(404, errors)
+
+        # 要求必须正被一条已认/待复核互认占用，候补才有意义
+        occupant = conn.execute(
+            "SELECT id, status FROM recognitions WHERE requirement_id = ? "
+            "AND status IN ('confirmed', 'pending')",
+            (body.requirement_id,),
+        ).fetchone()
+        if occupant is None:
+            raise HTTPException(
+                409,
+                f"requirement {body.requirement_id!r} is not occupied by an "
+                "active recognition; submit a recognition instead",
+            )
+        # 课程不能已被互认占用
+        if conn.execute(
+            "SELECT 1 FROM recognitions WHERE course_id = ? "
+            "AND status IN ('confirmed', 'pending')",
+            (body.course_id,),
+        ).fetchone():
+            raise HTTPException(
+                409,
+                f"course {body.course_id!r} already occupied by an active recognition",
+            )
+        # 一门课程至多一条未兑现候补
+        existing = conn.execute(
+            "SELECT id, requirement_id FROM waitlists "
+            "WHERE course_id = ? AND status = 'waiting'",
+            (body.course_id,),
+        ).fetchone()
+        if existing is not None:
+            raise HTTPException(
+                409,
+                f"course {body.course_id!r} already has an open waitlist "
+                f"{existing['id']} for requirement "
+                f"{existing['requirement_id']!r}",
+            )
+        cur = conn.execute(
+            "INSERT INTO waitlists (course_id, requirement_id, status) "
+            "VALUES (?, ?, 'waiting')",
+            (body.course_id, body.requirement_id),
+        )
+        waitlist_id = cur.lastrowid
+        row = conn.execute(
+            "SELECT id, course_id, requirement_id, status, recognition_id, "
+            "created_at, fulfilled_at FROM waitlists WHERE id = ?",
+            (waitlist_id,),
+        ).fetchone()
+    return _row_to_waitlist(row)
+
+
+@app.get("/waitlists")
+def list_waitlists(
+    requirement_id: Optional[str] = Query(default=None, min_length=1, max_length=64),
+    course_id: Optional[str] = Query(default=None, min_length=1, max_length=64),
+    status: Optional[str] = Query(default=None, pattern="^(waiting|fulfilled)$"),
+):
+    """查询候补：可按要求（看候补顺序）、课程、状态过滤，按登记顺序返回。"""
+    sql = (
+        "SELECT id, course_id, requirement_id, status, recognition_id, "
+        "created_at, fulfilled_at FROM waitlists"
+    )
+    clauses, params = [], []
+    if requirement_id is not None:
+        clauses.append("requirement_id = ?")
+        params.append(requirement_id)
+    if course_id is not None:
+        clauses.append("course_id = ?")
+        params.append(course_id)
+    if status is not None:
+        clauses.append("status = ?")
+        params.append(status)
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY id"
+    with db.read_conn() as conn:
+        rows = conn.execute(sql, tuple(params)).fetchall()
+    return [_row_to_waitlist(r) for r in rows]
 
 
 # ---------------------------------------------------------------- 进度查询
